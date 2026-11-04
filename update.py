@@ -5,10 +5,12 @@ Needs: pandas, requests.
 
 Files it keeps in this folder:
   data.json        the site's data (oldest first), appended every run
-  history.csv.gz   last ~150 trading days of per-stock close/volume (EMA warm-up)
+  history.csv.gz   last ~420 days of per-stock OHLC/volume (EMA + screeners). Repo me commit nahi hoti, Actions cache me rehti hai.
+  screener_data.json  Sourav Strong Sector and Group Mover Finder ka data (screeners.py banata hai)
 
 Definitions (calibrate once against your Chartink numbers, see README):
-  universe  EQ series stocks with turnover >= 10 crore that day
+  universe  same as the Chartink filter: 10-day avg volume x close / 1 crore > 10
+            AND close > 10 (rupees)
   MR20      % of universe with adjusted close above its 20-day EMA
   U4 / D4   close up / down 4%+ vs previous close AND volume above previous day
   W20       adjusted close up 20%+ vs 5 trading days ago
@@ -37,9 +39,12 @@ SCREENER_OUT = os.path.join(HERE, "screener_data.json")
 LISTING = os.path.join(HERE, "listing_dates.csv")   # NSE EQUITY_L.csv se: symbol,listing_date
 LISTING_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 
-TURNOVER_MIN = 10e7  # Rs 10 crore
+AVG_TURNOVER_CR = 10  # 10-day avg volume x close, in crore
+MIN_PRICE = 10
+METHOD = "chartink-v2"  # bump when the calculation changes (forces a recompute)
+BASE_END = "2026-10-09"  # last day that comes from the original sheet
 U4_PCT = 0.04
-WARMUP_DAYS = 420  # calendar days of history (EMA + weekly volume SMA(50) + cool-off ke liye)
+WARMUP_DAYS = 420  # calendar days of history (EMA + screeners: weekly volume SMA(50), cool-off)
 
 URLS = [
     # UDiFF format (NSE, from July 2024)
@@ -138,7 +143,8 @@ def compute_day(hist: pd.DataFrame, day: str):
     adj = close * factor
 
     ema = adj.ewm(span=20, adjust=False, min_periods=20).mean()
-    universe = turn.loc[day] >= TURNOVER_MIN
+    avg_vol10 = vol.rolling(10, min_periods=10).mean().loc[day]
+    universe = (avg_vol10 * close.loc[day] / 1e7 > AVG_TURNOVER_CR) & (close.loc[day] > MIN_PRICE)
     last_adj, last_ema = adj.loc[day], ema.loc[day]
     valid = universe & last_ema.notna() & last_adj.notna()
     mr20 = round(100 * (last_adj[valid] > last_ema[valid]).mean(), 1)
@@ -161,6 +167,9 @@ def main():
     with open(DATA) as f:
         payload = json.load(f)
     rows = payload["rows"]
+    if payload.get("method") != METHOD:
+        # calculation changed: keep the sheet's history, recompute everything after it
+        rows = [r for r in rows if r["date"] <= BASE_END]
     last = dt.date.fromisoformat(rows[-1]["date"])
     today = dt.date.today()
 
@@ -191,12 +200,18 @@ def main():
     hist.to_csv(HIST, index=False, compression="gzip")
 
     todo = [x for x in sorted(hist["date"].unique()) if x > rows[-1]["date"]]
-    if todo:
+    if todo or payload.get("method") != METHOD:
         update_monitor(rows, hist, todo)
     else:
         print("No new trading days for MR20 monitor.")
     # screeners: har run me dobara (sector_map.csv badli ho to naya mapping bhi lag jaye)
-    screeners.run(hist, SECTORS, SCREENER_OUT, LISTING)
+    # Strong Sector page me koi dikkat aaye to bhi market monitor (data.json) ka kaam na rukey
+    try:
+        screeners.run(hist, SECTORS, SCREENER_OUT, LISTING)
+    except Exception:  # noqa: BLE001
+        import traceback
+        print("SCREENERS FAIL (monitor ka data.json theek bana hai):", file=sys.stderr)
+        traceback.print_exc()
 
 
 def update_monitor(rows, hist, todo):
@@ -206,7 +221,7 @@ def update_monitor(rows, hist, todo):
         print("added", base[-1])
     full = enrich(base)
     with open(DATA, "w") as f:
-        json.dump({"updated": full[-1]["date"], "rows": full}, f, separators=(",", ":"))
+        json.dump({"updated": full[-1]["date"], "method": METHOD, "rows": full}, f, separators=(",", ":"))
 
 
 if __name__ == "__main__":
